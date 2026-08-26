@@ -2,6 +2,7 @@
 
 # Exit on any error
 set -e
+set -o pipefail
 
 # ==========================================
 # Argument Parsing
@@ -77,6 +78,13 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     echo "==========================================="
     echo "[*] Downloading and running ReSukiSU remote setup script..."
     curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+    # ReSukiSU Kconfig choice defaults to KSU_TRACEPOINT_HOOK (GKI 2.0 / 5.10+ only).
+    # This tree is Linux 4.19 non-GKI and already has SuSFS v2.2.0 inline hooks.
+    # Leaving the default causes: \"TP hooks are incompatible with Non-GKI\" (make exit 2).
+    if [ -f KernelSU/kernel/Kconfig ]; then
+        sed -i 's/default KSU_TRACEPOINT_HOOK/default KSU_SUSFS/' KernelSU/kernel/Kconfig
+        echo "[+] ReSukiSU default hook switched to KSU_SUSFS for non-GKI 4.19"
+    fi
     echo "[+] KernelSU setup finished."
 fi
 
@@ -202,12 +210,19 @@ build_target() {
     scripts/config --file "${OUT_DIR}/.config" -e BBG
 
     # 2. KernelSU configurations
+    # Force SuSFS inline hook. scripts/config -e KSU_SUSFS does not disable the
+    # other choice member, so TRACEPOINT can remain y and olddefconfig may keep it.
     if [ "$ENABLE_KSU" -eq 1 ]; then
-        echo "[*] Injecting KernelSU & SUSFS configurations..."
+        echo "[*] Injecting KernelSU & SUSFS configurations (non-GKI 4.19)..."
         scripts/config --file "${OUT_DIR}/.config" \
             -e KSU \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
             -e THREAD_INFO_IN_TASK \
-            -e KSU_SUSFS
+            -d KSU_TRACEPOINT_HOOK \
+            -d KSU_MANUAL_HOOK \
+            -e KSU_SUSFS \
+            -d CC_WERROR
     fi
 
     # 3. MIUI configurations
@@ -245,6 +260,36 @@ build_target() {
     echo "[*] Updating config (make olddefconfig)..."
     make "${MAKE_OPTS[@]}" olddefconfig
 
+    if [ "$ENABLE_KSU" -eq 1 ]; then
+        # olddefconfig may restore the choice default; re-apply and verify.
+        scripts/config --file "${OUT_DIR}/.config" \
+            -e KSU \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
+            -e THREAD_INFO_IN_TASK \
+            -d KSU_TRACEPOINT_HOOK \
+            -d KSU_MANUAL_HOOK \
+            -e KSU_SUSFS \
+            -d CC_WERROR
+        make "${MAKE_OPTS[@]}" olddefconfig
+
+        echo "[*] KernelSU-related config:"
+        grep -E '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_THREAD_INFO_IN_TASK|^CONFIG_CC_WERROR' "${OUT_DIR}/.config" || true
+
+        if grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' "${OUT_DIR}/.config"; then
+            echo "[!] Error: CONFIG_KSU_TRACEPOINT_HOOK=y. 4.19 non-GKI cannot use Tracepoint hooks."
+            exit 1
+        fi
+        if ! grep -q '^CONFIG_KSU=y' "${OUT_DIR}/.config"; then
+            echo "[!] Error: CONFIG_KSU is not enabled."
+            exit 1
+        fi
+        if ! grep -q '^CONFIG_KSU_SUSFS=y' "${OUT_DIR}/.config"; then
+            echo "[!] Error: CONFIG_KSU_SUSFS is not enabled. SuSFS inline hook is required."
+            exit 1
+        fi
+    fi
+
     # ----------------------------------------------------
     # Compilation
     # ----------------------------------------------------
@@ -267,7 +312,7 @@ build_target() {
         find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "${OUT_DIR}/arch/arm64/boot/dtb"
 
         echo "[*] Packaging to AnyKernel3 ($OS_TYPE)..."
-        # 确保独立打包：清空现有的 kernels 目录
+        # 硫f保独立打包：清空现有的 kernels 目录
         rm -rf anykernel/kernels/*
         mkdir -p "anykernel/kernels/${OS_TYPE}/"
         
@@ -278,7 +323,7 @@ build_target() {
             cp "${OUT_DIR}/arch/arm64/boot/dtbo.img" "anykernel/kernels/${OS_TYPE}/"
         fi
         
-        # 确定 ZIP 文件名
+        # 硫3定 ZIP 文件名
         local KSU_ZIP_STR="NoKernelSU"
         if [ "$ENABLE_KSU" -eq 1 ]; then
             KSU_ZIP_STR="ReSukiSU-SuSFS"
