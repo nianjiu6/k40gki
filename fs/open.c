@@ -360,7 +360,7 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
 #ifdef CONFIG_KSU_SUSFS
 extern struct static_key_true ksu_su_compat_enabled;
 extern bool __ksu_is_allow_uid_for_current(uid_t uid);
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
 			int *flags);
 #endif
 long do_faccessat(int dfd, const char __user *filename, int mode)
@@ -376,9 +376,15 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
 #ifdef CONFIG_KSU_SUSFS
 	if (likely(susfs_is_current_proc_umounted()))
 		goto orig_flow;
-	if (static_branch_likely(&ksu_su_compat_enabled))
-		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
-			ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+	if (static_branch_likely(&ksu_su_compat_enabled) &&
+	    unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+		struct filename *ksu_fn = getname(filename);
+
+		if (!IS_ERR(ksu_fn)) {
+			/* Current ReSukiSU expects struct filename **, not __user char **. */
+			ksu_handle_faccessat(&dfd, &ksu_fn, &mode, NULL);
+			putname(ksu_fn);
+		}
 	}
 
 orig_flow:
