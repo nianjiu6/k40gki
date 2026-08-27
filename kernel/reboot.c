@@ -329,7 +329,11 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 	int ret = 0;
 #ifdef CONFIG_KSU_SUSFS
     if (system_state == SYSTEM_RUNNING) {
-        ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+        int ksu_ret = ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+
+        /* ReSukiSU supercall uses non-LINUX_REBOOT magics. Do not continue into a real reboot. */
+        if (!ksu_ret && magic1 != LINUX_REBOOT_MAGIC1)
+            return 0;
     }
 #endif
 
