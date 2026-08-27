@@ -85,6 +85,8 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
         sed -i 's/default KSU_TRACEPOINT_HOOK/default KSU_SUSFS/' KernelSU/kernel/Kconfig
         echo "[+] ReSukiSU default hook switched to KSU_SUSFS for non-GKI 4.19"
     fi
+    echo "[*] Applying 4.19 manager-launch runtime patches..."
+    python3 scripts/patch_resukisu_419.py
     echo "[+] KernelSU setup finished."
 fi
 
@@ -222,7 +224,12 @@ build_target() {
             -d KSU_TRACEPOINT_HOOK \
             -d KSU_MANUAL_HOOK \
             -e KSU_SUSFS \
-            -d CC_WERROR
+            -d CC_WERROR \
+            -d CFI_CLANG \
+            -d CFI_PERMISSIVE \
+            -d LTO_CLANG \
+            -e LTO_NONE \
+            -d SHADOW_CALL_STACK
     fi
 
     # 3. MIUI configurations
@@ -270,14 +277,27 @@ build_target() {
             -d KSU_TRACEPOINT_HOOK \
             -d KSU_MANUAL_HOOK \
             -e KSU_SUSFS \
-            -d CC_WERROR
+            -d CC_WERROR \
+            -d CFI_CLANG \
+            -d CFI_PERMISSIVE \
+            -d LTO_CLANG \
+            -e LTO_NONE \
+            -d SHADOW_CALL_STACK
         make "${MAKE_OPTS[@]}" olddefconfig
 
         echo "[*] KernelSU-related config:"
-        grep -E '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_THREAD_INFO_IN_TASK|^CONFIG_CC_WERROR' "${OUT_DIR}/.config" || true
+        grep -E '^CONFIG_KSU|^# CONFIG_KSU|^CONFIG_THREAD_INFO_IN_TASK|^CONFIG_CC_WERROR|^CONFIG_CFI|^# CONFIG_CFI|^CONFIG_LTO|^# CONFIG_LTO' "${OUT_DIR}/.config" || true
 
         if grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' "${OUT_DIR}/.config"; then
             echo "[!] Error: CONFIG_KSU_TRACEPOINT_HOOK=y. 4.19 non-GKI cannot use Tracepoint hooks."
+            exit 1
+        fi
+        if grep -q '^CONFIG_CFI_CLANG=y' "${OUT_DIR}/.config"; then
+            echo "[!] Error: CONFIG_CFI_CLANG=y. Manager ioctl/anon inode will panic on 4.19."
+            exit 1
+        fi
+        if grep -q '^CONFIG_LTO_CLANG=y' "${OUT_DIR}/.config"; then
+            echo "[!] Error: CONFIG_LTO_CLANG=y. CFI depends on LTO; keep both off for KSU."
             exit 1
         fi
         if ! grep -q '^CONFIG_KSU=y' "${OUT_DIR}/.config"; then
