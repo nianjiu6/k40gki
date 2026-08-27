@@ -196,7 +196,7 @@ EXPORT_SYMBOL(vfs_statx_fd);
 #ifdef CONFIG_KSU_SUSFS
 extern struct static_key_true ksu_su_compat_enabled;
 extern bool __ksu_is_allow_uid_for_current(uid_t uid);
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
 #endif
 
 int vfs_statx(int dfd, const char __user *filename, int flags,
@@ -209,9 +209,15 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
 #ifdef CONFIG_KSU_SUSFS
 	if (likely(susfs_is_current_proc_umounted()))
 		goto orig_flow;
-	if (static_branch_likely(&ksu_su_compat_enabled)) {
-		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
-			ksu_handle_stat(&dfd, &filename, &flags);
+	if (static_branch_likely(&ksu_su_compat_enabled) &&
+	    unlikely(__ksu_is_allow_uid_for_current(current_uid().val))) {
+		struct filename *ksu_fn = getname(filename);
+
+		if (!IS_ERR(ksu_fn)) {
+			/* Current ReSukiSU expects struct filename **, not __user char **. */
+			ksu_handle_stat(&dfd, &ksu_fn, &flags);
+			putname(ksu_fn);
+		}
 	}
 orig_flow:
 #endif
