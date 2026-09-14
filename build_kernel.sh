@@ -70,6 +70,23 @@ echo "[*] Setting up ccache in $CCACHE_DIR..."
 mkdir -p "$CCACHE_DIR"
 
 # ==========================================
+# Kernel Version & Build Banner Pinning
+# ==========================================
+# Match the stock HyperOS banner on alioth:
+#   4.19.157-perf-g92c089fc2d37 #1 SMP PREEMPT Wed Oct 29 11:41:46 UTC 2025
+# SUBLEVEL lives in the top Makefile, "-perf" comes from CONFIG_LOCALVERSION,
+# and scripts/setlocalversion returns .scmversion verbatim when it exists.
+EXPECTED_KERNEL_RELEASE="4.19.157-perf-g92c089fc2d37"
+EXPECTED_BUILD_TIMESTAMP="Wed Oct 29 11:41:46 UTC 2025"
+
+export KBUILD_BUILD_TIMESTAMP="${EXPECTED_BUILD_TIMESTAMP}"
+export KBUILD_BUILD_VERSION=1
+printf '%s\n' '-g92c089fc2d37' > .scmversion
+
+echo "[*] Pinned kernel release: ${EXPECTED_KERNEL_RELEASE}"
+echo "[*] Pinned build time: ${EXPECTED_BUILD_TIMESTAMP}"
+
+# ==========================================
 # KernelSU Setup
 # ==========================================
 if [ "$ENABLE_KSU" -eq 1 ]; then
@@ -314,7 +331,23 @@ build_target() {
     # Compilation
     # ----------------------------------------------------
     echo "[*] Building kernel..."
-    make "${MAKE_OPTS[@]}" 
+    make "${MAKE_OPTS[@]}"
+
+    # ----------------------------------------------------
+    # Verify the pinned version banner
+    # ----------------------------------------------------
+    local RELEASE_FILE="${OUT_DIR}/include/config/kernel.release"
+    local COMPILE_H="${OUT_DIR}/include/generated/compile.h"
+
+    if [ ! -f "$RELEASE_FILE" ] || [ "$(cat "$RELEASE_FILE")" != "$EXPECTED_KERNEL_RELEASE" ]; then
+        echo "[!] Error: kernel release is '$(cat "$RELEASE_FILE" 2>/dev/null)', expected '${EXPECTED_KERNEL_RELEASE}'."
+        exit 1
+    fi
+    if [ ! -f "$COMPILE_H" ] || ! grep -qF "$EXPECTED_BUILD_TIMESTAMP" "$COMPILE_H"; then
+        echo "[!] Error: build timestamp does not match '${EXPECTED_BUILD_TIMESTAMP}'."
+        exit 1
+    fi
+    echo "[+] Version banner verified: $(cat "$RELEASE_FILE") @ ${EXPECTED_BUILD_TIMESTAMP}"
 
     # Restore DTS backup for MIUI
     if [ "$OS_TYPE" == "miui" ]; then
