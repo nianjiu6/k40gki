@@ -82,6 +82,11 @@ EXPECTED_BUILD_TIMESTAMP="Wed Oct 29 11:41:46 UTC 2025"
 export KBUILD_BUILD_TIMESTAMP="${EXPECTED_BUILD_TIMESTAMP}"
 export KBUILD_BUILD_VERSION=1
 printf '%s\n' '-g92c089fc2d37' > .scmversion
+# setlocalversion prepends the contents of every localversion* file to
+# CONFIG_LOCALVERSION. This tree ships localversion-cip (-cip132) and
+# localversion-st (-st16), which would turn the release into
+# 4.19.157-cip132-st16-perf-g92c089fc2d37.
+rm -f localversion*
 
 echo "[*] Pinned kernel release: ${EXPECTED_KERNEL_RELEASE}"
 echo "[*] Pinned build time: ${EXPECTED_BUILD_TIMESTAMP}"
@@ -343,8 +348,9 @@ build_target() {
         echo "[!] Error: kernel release is '$(cat "$RELEASE_FILE" 2>/dev/null)', expected '${EXPECTED_KERNEL_RELEASE}'."
         exit 1
     fi
-    if [ ! -f "$COMPILE_H" ] || ! grep -qF "$EXPECTED_BUILD_TIMESTAMP" "$COMPILE_H"; then
-        echo "[!] Error: build timestamp does not match '${EXPECTED_BUILD_TIMESTAMP}'."
+    if [ ! -f "$COMPILE_H" ] ||
+       ! grep -qF "#1 SMP PREEMPT ${EXPECTED_BUILD_TIMESTAMP}" "$COMPILE_H"; then
+        echo "[!] Error: UTS_VERSION does not match '#1 SMP PREEMPT ${EXPECTED_BUILD_TIMESTAMP}'."
         exit 1
     fi
     echo "[+] Version banner verified: $(cat "$RELEASE_FILE") @ ${EXPECTED_BUILD_TIMESTAMP}"
