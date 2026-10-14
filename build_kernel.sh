@@ -50,6 +50,7 @@ KERNEL_DIR="$(pwd)"
 TOOLCHAIN_BIN="${TOOLCHAIN_BIN:-$HOME/zyc-clang/bin}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 RESUKISU_REF="239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb"
+RESUKISU_UAPI5_REF="8770c7e324a22895703c4916b8a16520e0b81c79"
 BBG_REF="a54e0dc6cf0aff4dd87fec49644a02d2eb612905"
 ANYKERNEL_REF="332c0e860d3a27ad7c746ba813b9fb09afcc0684"
 
@@ -114,6 +115,20 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     git -C KernelSU cat-file -e "${RESUKISU_REF}^{commit}" || git -C KernelSU fetch origin "${RESUKISU_REF}"
     git -C KernelSU checkout --detach "${RESUKISU_REF}"
     test "$(git -C KernelSU rev-parse HEAD)" = "${RESUKISU_REF}"
+    echo "[*] Backporting UAPI 5 kernel services protocol (${RESUKISU_UAPI5_REF})..."
+    git -C KernelSU cat-file -e "${RESUKISU_UAPI5_REF}^{commit}" || git -C KernelSU fetch origin "${RESUKISU_UAPI5_REF}"
+    git -C KernelSU show --format= --binary "${RESUKISU_UAPI5_REF}" -- \
+        kernel/supercall/dispatch.c uapi/supercall.h > "${KERNEL_DIR}/.resukisu-uapi5.patch"
+    if git -C KernelSU apply --reverse --check "${KERNEL_DIR}/.resukisu-uapi5.patch" 2>/dev/null; then
+        echo "[*] UAPI 5 services backport already applied."
+    else
+        git -C KernelSU apply --check "${KERNEL_DIR}/.resukisu-uapi5.patch"
+        git -C KernelSU apply "${KERNEL_DIR}/.resukisu-uapi5.patch"
+    fi
+    grep -qF 'KERNEL_SU_UAPI_VERSION = 5;' KernelSU/uapi/supercall.h
+    grep -qF 'case EVENT_SERVICES:' KernelSU/kernel/supercall/dispatch.c
+    grep -qF 'services_started = true;' KernelSU/kernel/supercall/dispatch.c
+    test "$(git -C KernelSU rev-parse HEAD)" = "${RESUKISU_REF}"
     ln -sfn ../KernelSU/kernel drivers/kernelsu
     if ! grep -qF 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile; then
         printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
@@ -130,6 +145,7 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     fi
     echo "[*] Applying 4.19 manager-launch runtime patches..."
     python3 scripts/patch_resukisu_419.py
+    python3 -m unittest discover -s scripts/tests -p test_patch_resukisu_419.py -v
     echo "[+] KernelSU setup finished."
 fi
 
@@ -401,11 +417,22 @@ build_target() {
         
         echo "[*] Preparing device-checked AnyKernel3 ($OS_TYPE), preserving stock dtbo..."
         python3 scripts/package_anykernel.py anykernel "${OUT_DIR}" "${DEVICE_NAME}" "${OS_TYPE}"
+        local RESUKISU_ACTUAL_REF="disabled"
+        local RESUKISU_UAPI_VERSION="disabled"
+        local RESUKISU_SERVICES_REF="disabled"
+        if [ "$ENABLE_KSU" -eq 1 ]; then
+            RESUKISU_ACTUAL_REF=$(git -C KernelSU rev-parse HEAD)
+            RESUKISU_UAPI_VERSION=$(awk '/^static const __u32 KERNEL_SU_UAPI_VERSION = / {gsub(/;/, "", $NF); print $NF}' KernelSU/uapi/supercall.h)
+            RESUKISU_SERVICES_REF="$RESUKISU_UAPI5_REF"
+            test "$RESUKISU_ACTUAL_REF" = "$RESUKISU_REF"
+            test "$RESUKISU_UAPI_VERSION" = 5
+        fi
         {
             printf 'device=%s\nos=%s\n' "${DEVICE_NAME}" "${OS_TYPE}"
             printf 'kernel_commit=%s\n' "$(git rev-parse HEAD)"
             printf 'kernel_release=%s\n' "$(cat "$RELEASE_FILE")"
-            printf 'resukisu_commit=%s\n' "$([ "$ENABLE_KSU" -eq 1 ] && echo "$RESUKISU_REF" || echo disabled)"
+            printf 'resukisu_commit=%s\n' "$RESUKISU_ACTUAL_REF"
+            printf 'resukisu_uapi=%s\nresukisu_services_backport=%s\n' "$RESUKISU_UAPI_VERSION" "$RESUKISU_SERVICES_REF"
             printf 'baseband_guard_commit=%s\nanykernel_commit=%s\n' "$BBG_REF" "$ANYKERNEL_REF"
             printf 'dtbo=preserved\n'
         } > anykernel/build-info.txt

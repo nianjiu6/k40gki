@@ -1,4 +1,8 @@
 import importlib.util
+import os
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -64,6 +68,86 @@ class PatchReSukiSU419Tests(unittest.TestCase):
         self.assertIn("if (!ksu_cred)", patched)
         PATCH.patch_sucompat_ksu_cred()
         self.assertEqual(path.read_text(encoding="utf-8"), patched)
+
+
+class Uapi5ServicesTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = Path(os.environ.get("KSU_SOURCE_DIR", "KernelSU"))
+        if not cls.source.is_dir():
+            raise unittest.SkipTest("KernelSU source is not present yet")
+        cls.header = (cls.source / "uapi/supercall.h").read_text(encoding="utf-8")
+        cls.dispatch = (cls.source / "kernel/supercall/dispatch.c").read_text(encoding="utf-8")
+
+    def test_uapi5_has_services_event(self):
+        self.assertIn("KERNEL_SU_UAPI_VERSION = 5;", self.header)
+        self.assertIn("DEFINE_KSU_UAPI_CONST(__u32, EVENT_SERVICES, 4)", self.header)
+        self.assertIn("case EVENT_SERVICES:", self.dispatch)
+
+    def test_actual_services_handler_start_skip_reset(self):
+        compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+        self.assertIsNotNone(compiler, "a host C compiler is required")
+        start = self.dispatch.index("static int do_report_event(void __user *arg)")
+        end = self.dispatch.index("static int do_set_sepolicy", start)
+        handler = self.dispatch[start:end]
+        events = dict(re.findall(
+            r"DEFINE_KSU_UAPI_CONST\(__u32, (EVENT_\w+), (\d+)\)", self.header
+        ))
+        declarations = "\n".join(f"#define {name} {value}" for name, value in events.items())
+        source = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include <errno.h>
+#define __user
+#define CONFIG_KSU_SUSFS 1
+#define pr_info(...) ((void)0)
+struct ksu_report_event_cmd { unsigned int event; };
+static bool ksu_late_loaded;
+static int post_count, boot_count, mount_count, sdcard_count;
+static int copy_from_user(void *dst, const void *src, unsigned long size) {
+    if (!src) return 1;
+    memcpy(dst, src, size);
+    return 0;
+}
+static void on_post_fs_data(void) { post_count++; }
+static void on_boot_completed(void) { boot_count++; }
+static void on_module_mounted(void) { mount_count++; }
+static void susfs_start_sdcard_monitor_fn(void) { sdcard_count++; }
+'''
+        source += declarations + "\n" + handler + r'''
+static int report(unsigned int event) {
+    struct ksu_report_event_cmd cmd = {event};
+    return do_report_event(&cmd);
+}
+int main(void) {
+    assert(do_report_event(0) == -EFAULT);
+    assert(report(EVENT_POST_FS_DATA) == 0);
+    assert(report(EVENT_SERVICES) == 1);
+    assert(report(EVENT_SERVICES) == 0);
+    assert(do_report_event(0) == -EFAULT);
+    assert(report(EVENT_SERVICES) == 0);
+    assert(report(999) == 0);
+    assert(report(EVENT_SERVICES) == 0);
+    assert(report(EVENT_POST_FS_DATA) == 0);
+    assert(post_count == 1);
+    assert(report(EVENT_SERVICES) == 1);
+    assert(report(EVENT_SERVICES) == 0);
+    assert(report(EVENT_BOOT_COMPLETED) == 0);
+    assert(report(EVENT_BOOT_COMPLETED) == 0);
+    assert(boot_count == 1 && sdcard_count == 1);
+    assert(report(EVENT_MODULE_MOUNTED) == 0);
+    assert(mount_count == 1);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / ("services.exe" if os.name == "nt" else "services")
+            subprocess.run(
+                [compiler, "-x", "c", "-", "-o", str(executable)],
+                input=source, text=True, check=True, capture_output=True,
+            )
+            subprocess.run([str(executable)], check=True, capture_output=True)
 
 
 if __name__ == "__main__":
