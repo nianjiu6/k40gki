@@ -6,7 +6,7 @@ on:
       device:
         description: 'Target Device Code (设备代号)'
         required: true
-        default: 'lmi'
+        default: 'alioth'
         type: choice
         options:
           - alioth
@@ -26,21 +26,32 @@ on:
         description: 'Enable KernelSU (ReSukiSU)'
         required: true
         type: boolean
-        default: false
+        default: true
       target_os:
         description: 'Target OS (目标系统)'
         required: true
         type: choice
-        default: 'both'
+        default: 'miui'
         options:
           - aosp
           - miui
           - both
 
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-${{ github.ref }}-${{ inputs.device }}-${{ inputs.target_os }}-${{ inputs.ksu }}
+  cancel-in-progress: false
+
 jobs:
   build-kernel:
     name: Build ${{ github.event.inputs.device }} | KSU:${{ github.event.inputs.ksu }} | OS:${{ github.event.inputs.target_os }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     
     steps:
     - name: Checkout Repository
@@ -55,44 +66,70 @@ jobs:
           git gnupg gperf imagemagick libncurses-dev \
           lib32readline-dev lib32z1-dev liblz4-tool \
           libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
-          schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+          schedtool squashfs-tools xsltproc zip unzip zlib1g-dev python3 \
+          python-is-python3 cpio libelf-dev
+
+    - name: Validate Build Helpers
+      run: |
+        bash -n build_kernel.sh
+        python3 -m unittest discover -s scripts/tests -v
           
     - name: Cache ccache
       uses: actions/cache@v6
       with:
         path: ~/.cache/ccache_mikernel
-        key: ${{ runner.os }}-kernel-ccache-${{ github.event.inputs.device }}-${{ github.run_id }}
+        key: ${{ runner.os }}-clang16-ccache-${{ inputs.device }}-${{ inputs.target_os }}-${{ inputs.ksu }}-${{ github.run_id }}
         restore-keys: |
-          ${{ runner.os }}-kernel-ccache-${{ github.event.inputs.device }}-
-          ${{ runner.os }}-kernel-ccache-
+          ${{ runner.os }}-clang16-ccache-${{ inputs.device }}-${{ inputs.target_os }}-${{ inputs.ksu }}-
 
     - name: Setup zyc-clang 16 Toolchain
       run: |
         mkdir -p $HOME/zyc-clang
         cd $HOME/zyc-clang
-        wget -q https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260510-release/Clang-16.0.6-20260510.tar.gz
-        tar -zxvf Clang-16.0.6-20260510.tar.gz
+        curl --fail --location --retry 5 --connect-timeout 30 \
+          https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260510-release/Clang-16.0.6-20260510.tar.gz \
+          --output clang.tar.gz
+        tar -xzf clang.tar.gz
+        ./bin/clang --version
 
     - name: Run Build Script
+      env:
+        DEVICE: ${{ inputs.device }}
+        ENABLE_KSU: ${{ inputs.ksu }}
+        TARGET_OS: ${{ inputs.target_os }}
       run: |
-        chmod +x build_kernel.sh
-        
-        ARGS="${{ github.event.inputs.device }}"
-        
-        if [ "${{ github.event.inputs.ksu }}" == "true" ]; then
-          ARGS="$ARGS ksu"
+        set -o pipefail
+        mkdir -p logs
+        args=("$DEVICE")
+        if [ "$ENABLE_KSU" = "true" ]; then
+          args+=(ksu)
         fi
-        
-        if [ "${{ github.event.inputs.target_os }}" != "both" ]; then
-          ARGS="$ARGS ${{ github.event.inputs.target_os }}"
+        if [ "$TARGET_OS" != "both" ]; then
+          args+=("$TARGET_OS")
         fi
-        
-        echo "Executing command: ./build_kernel.sh $ARGS"
-        ./build_kernel.sh $ARGS
+        bash build_kernel.sh "${args[@]}" 2>&1 | tee logs/build.log
+
+    - name: Upload Build Diagnostics
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: diagnostics-${{ inputs.device }}-${{ github.run_id }}
+        include-hidden-files: true
+        path: |
+          logs/
+          out_*/.config
+          out_*/include/config/kernel.release
+          out_*/include/generated/compile.h
+          anykernel/build-info.txt
+        if-no-files-found: warn
+        retention-days: 14
 
     - name: Upload Flashable ZIP
       uses: actions/upload-artifact@v7
       with:
         name: APTKernel-${{ github.event.inputs.device }}-${{ github.event.inputs.target_os }}-${{ github.run_id }}
-        path: APTKernel_*.zip
+        path: |
+          APTKernel_*.zip
+          APTKernel_*.zip.sha256
+        if-no-files-found: error
         compression-level: 0 # 已经被 zip 压缩过，无需再二次压缩

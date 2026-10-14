@@ -1,8 +1,11 @@
 #!/bin/bash
 
 # Exit on any error
-set -e
+set -eE
 set -o pipefail
+trap 'rc=$?; echo "[!] Build failed at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit "$rc"' ERR
+
+cd "$(dirname "$(realpath "$0")")"
 
 # ==========================================
 # Argument Parsing
@@ -44,7 +47,11 @@ done
 # Configuration & Environment
 # ==========================================
 KERNEL_DIR="$(pwd)"
-TOOLCHAIN_BIN="$HOME/zyc-clang/bin"
+TOOLCHAIN_BIN="${TOOLCHAIN_BIN:-$HOME/zyc-clang/bin}"
+BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
+RESUKISU_REF="239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb"
+BBG_REF="a54e0dc6cf0aff4dd87fec49644a02d2eb612905"
+ANYKERNEL_REF="332c0e860d3a27ad7c746ba813b9fb09afcc0684"
 
 export PATH="${TOOLCHAIN_BIN}:${PATH}"
 export ARCH="arm64"
@@ -68,6 +75,7 @@ clang --version || { echo "[!] Clang not found at ${TOOLCHAIN_BIN}. Please check
 
 echo "[*] Setting up ccache in $CCACHE_DIR..."
 mkdir -p "$CCACHE_DIR"
+ccache --max-size=4G
 
 # ==========================================
 # Kernel Version & Build Banner Pinning
@@ -98,8 +106,21 @@ if [ "$ENABLE_KSU" -eq 1 ]; then
     echo "==========================================="
     echo " [*] Initializing KernelSU (ReSukiSU) Setup"
     echo "==========================================="
-    echo "[*] Downloading and running ReSukiSU remote setup script..."
-    curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+    echo "[*] Setting up ReSukiSU v4.2.0-rc3 (${RESUKISU_REF})..."
+    # Kbuild derives the manager version code from the complete commit history.
+    if [ ! -e KernelSU ]; then
+        git clone https://github.com/Baka-SU/BakaSU.git KernelSU
+    fi
+    git -C KernelSU cat-file -e "${RESUKISU_REF}^{commit}" || git -C KernelSU fetch origin "${RESUKISU_REF}"
+    git -C KernelSU checkout --detach "${RESUKISU_REF}"
+    test "$(git -C KernelSU rev-parse HEAD)" = "${RESUKISU_REF}"
+    ln -sfn ../KernelSU/kernel drivers/kernelsu
+    if ! grep -qF 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile; then
+        printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+    fi
+    if ! grep -qF 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
+        sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+    fi
     # ReSukiSU Kconfig choice defaults to KSU_TRACEPOINT_HOOK (GKI 2.0 / 5.10+ only).
     # This tree is Linux 4.19 non-GKI and already has SuSFS v2.2.0 inline hooks.
     # Leaving the default causes: \"TP hooks are incompatible with Non-GKI\" (make exit 2).
@@ -118,8 +139,14 @@ fi
 echo "==========================================="
 echo " [*] Initializing Baseband-guard Setup"
 echo "==========================================="
-echo "[*] Downloading and running Baseband-guard remote setup script..."
-wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+echo "[*] Setting up Baseband-guard (${BBG_REF})..."
+if [ ! -e Baseband-guard ]; then
+    git clone https://github.com/vc-teahouse/Baseband-guard.git Baseband-guard
+fi
+git -C Baseband-guard cat-file -e "${BBG_REF}^{commit}" || git -C Baseband-guard fetch origin "${BBG_REF}"
+git -C Baseband-guard checkout --detach "${BBG_REF}"
+bash Baseband-guard/setup.sh "${BBG_REF}"
+test "$(git -C Baseband-guard rev-parse HEAD)" = "${BBG_REF}"
 
 echo "[*] Patching security/Kconfig for baseband_guard..."
 sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
@@ -134,8 +161,12 @@ echo " [*] Initializing AnyKernel3 Workspace"
 echo "==========================================="
 rm -rf anykernel
 echo "[*] Cloning AnyKernel3..."
-git clone https://github.com/AstideLabs/AnyKernel3 -b master --single-branch --depth=1 anykernel
-echo "[+] AnyKernel3 cloned successfully."
+git init anykernel
+git -C anykernel remote add origin https://github.com/AstideLabs/AnyKernel3.git
+git -C anykernel fetch --depth=1 origin "${ANYKERNEL_REF}"
+git -C anykernel checkout --detach FETCH_HEAD
+test "$(git -C anykernel rev-parse HEAD)" = "${ANYKERNEL_REF}"
+echo "[+] AnyKernel3 checked out at ${ANYKERNEL_REF}."
 echo "==========================================="
 
 # ==========================================
@@ -150,7 +181,7 @@ build_target() {
     local OUT_DIR="${KERNEL_DIR}/out_${OS_TYPE}"
     
     local MAKE_OPTS=(
-        -j"$(nproc)"
+        -j"${BUILD_JOBS}"
         O="${OUT_DIR}"
         ARCH="${ARCH}"
         SUBARCH="${SUBARCH}"
@@ -158,6 +189,7 @@ build_target() {
         LLVM_IAS=1
         CC="ccache clang"
         HOSTCC="ccache clang"
+        PYTHON=python3
         CROSS_COMPILE="${CROSS_COMPILE}"
         CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}"
     )
@@ -367,20 +399,16 @@ build_target() {
         echo "[+] $OS_TYPE Build Successful!"
         echo "[+] Kernel Image path: ${OUT_DIR}/arch/arm64/boot/Image"
         
-        echo "[*] Generating dtb..."
-        find "${OUT_DIR}/arch/arm64/boot/dts" -name '*.dtb' -exec cat {} + > "${OUT_DIR}/arch/arm64/boot/dtb"
-
-        echo "[*] Packaging to AnyKernel3 ($OS_TYPE)..."
-        # 硫f保独立打包：清空现有的 kernels 目录
-        rm -rf anykernel/kernels/*
-        mkdir -p "anykernel/kernels/${OS_TYPE}/"
-        
-        cp "${OUT_DIR}/arch/arm64/boot/Image" "anykernel/kernels/${OS_TYPE}/"
-        cp "${OUT_DIR}/arch/arm64/boot/dtb" "anykernel/kernels/${OS_TYPE}/"
-        
-        if [ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]; then
-            cp "${OUT_DIR}/arch/arm64/boot/dtbo.img" "anykernel/kernels/${OS_TYPE}/"
-        fi
+        echo "[*] Preparing device-checked AnyKernel3 ($OS_TYPE), preserving stock dtbo..."
+        python3 scripts/package_anykernel.py anykernel "${OUT_DIR}" "${DEVICE_NAME}" "${OS_TYPE}"
+        {
+            printf 'device=%s\nos=%s\n' "${DEVICE_NAME}" "${OS_TYPE}"
+            printf 'kernel_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'kernel_release=%s\n' "$(cat "$RELEASE_FILE")"
+            printf 'resukisu_commit=%s\n' "$([ "$ENABLE_KSU" -eq 1 ] && echo "$RESUKISU_REF" || echo disabled)"
+            printf 'baseband_guard_commit=%s\nanykernel_commit=%s\n' "$BBG_REF" "$ANYKERNEL_REF"
+            printf 'dtbo=preserved\n'
+        } > anykernel/build-info.txt
         
         # 硫3定 ZIP 文件名
         local KSU_ZIP_STR="NoKernelSU"
@@ -393,9 +421,11 @@ build_target() {
         
         echo "[*] Zipping $ZIP_FILENAME ..."
         pushd anykernel > /dev/null
-        zip -r9 "$ZIP_FILENAME" ./* -x .git .gitignore out/ ./*.zip > /dev/null
+        zip -r9 "$ZIP_FILENAME" META-INF tools anykernel.sh Image dtb build-info.txt > /dev/null
         mv "$ZIP_FILENAME" ../
         popd > /dev/null
+        unzip -t "$ZIP_FILENAME"
+        sha256sum "$ZIP_FILENAME" > "${ZIP_FILENAME}.sha256"
         
         echo "[+] $OS_TYPE kernel binaries successfully packed into: $ZIP_FILENAME"
     else
